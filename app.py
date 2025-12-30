@@ -391,8 +391,124 @@ def calc_risks(flt: pd.DataFrame, m: pd.DataFrame, target_margin: float):
     status = "CRITICAL" if any(r["level"] == "CRIT" for r in risks) else "WARNING" if any(r["level"] == "WARN" for r in risks) else "OK"
     return risks, status
 
-def generate_insights(risks, m: pd.DataFrame, cmp, business_type: str, target_margin: float):
-    insights, actions = [], []
+# ============================================================
+# Consulting-style text layer (A)
+# ============================================================
+def consulting_risk_text(risk: dict) -> tuple[str, str]:
+    """
+    Returns (title, body) in 'top consulting' tone.
+    Keeps numeric details produced by risk detection in body (transparency).
+    """
+    t_raw = (risk.get("title") or "").lower()
+    details = risk.get("details") or ""
+
+    if "маржа" in t_raw and ("цел" in t_raw or "ниже" in t_raw):
+        return (
+            "Текущая структура затрат не позволяет достигать целевую прибыльность бизнеса",
+            details
+        )
+
+    if "падение маржи" in t_raw:
+        return (
+            "Маржинальность ухудшается месяц-к-месяцу — прибыль становится менее устойчивой",
+            details
+        )
+
+    if "концентрация" in t_raw:
+        return (
+            "Слишком высокая концентрация расходов в одной категории снижает управляемость затрат",
+            details
+        )
+
+    if "убыток" in t_raw:
+        return (
+            "Последний месяц закрыт с отрицательным финансовым результатом",
+            details
+        )
+
+    if "рост расходов" in t_raw:
+        return (
+            "Темпы роста расходов опережают динамику выручки",
+            details
+        )
+
+    return (risk.get("title", "Выявлено управленческое отклонение"), details)
+
+
+def consulting_actions(main_risk: dict | None, business_type: str, top_category: str | None) -> list[str]:
+    """
+    3 actions, each with purpose. Consulting-style.
+    """
+    cat = top_category or "ключевой категории расходов"
+    t = ((main_risk or {}).get("title") or "").lower()
+
+    if main_risk and ("концентрация" in t):
+        return [
+            f"Контроль: провести экспресс-анализ крупнейших выплат в категории «{cat}». Цель: найти разовые/неэффективные списания.",
+            f"Ограничение: зафиксировать лимит по категории «{cat}» на следующий месяц. Цель: остановить рост постоянных затрат.",
+            "Структура: пересмотреть регулярные договоры/подписки и правила согласования. Цель: снизить концентрацию и вернуть управляемость."
+        ]
+
+    if main_risk and ("маржа" in t):
+        return [
+            "Диагностика: определить статьи расходов, которые давят на маржу. Цель: выделить затраты, не масштабируемые с выручкой.",
+            "Коррекция: скорректировать структуру затрат или ценовую модель. Цель: приблизить маржу к целевому уровню.",
+            "Контроль: ввести ежемесячный мониторинг маржи и 3–5 ключевых статей. Цель: не допускать повторных отклонений."
+        ]
+
+    if main_risk and ("убыток" in t):
+        return [
+            "Срочный контроль: ограничить необязательные расходы на 2–4 недели. Цель: остановить формирование убытка.",
+            "Разбор причин: отделить разовые платежи от системных расходов. Цель: понять, что можно быстро сократить.",
+            "План восстановления: сформировать 2–3 гипотезы роста выручки/оптимизации затрат на 30 дней. Цель: выйти в плюс в следующем периоде."
+        ]
+
+    if main_risk and ("рост расходов" in t):
+        return [
+            "Проверка состава расходов: выделить разовые и постоянные статьи. Цель: объяснить скачок расходов.",
+            "Ограничение: ввести недельный/месячный лимит на переменные расходы. Цель: остановить рост затрат.",
+            "Привязка к выручке: зафиксировать KPI (расходы/выручка) и контроль отклонений. Цель: стабилизировать маржу."
+        ]
+
+    # fallback + business nuance
+    base = [
+        "Контроль: проверить корректность данных и структуру категорий. Цель: исключить ошибки классификации.",
+        "Фокус: выделить 3 крупнейшие статьи расходов и драйверы роста. Цель: найти быстрый эффект.",
+        "Контроль: ввести простой регулярный мониторинг ключевых метрик. Цель: повысить управляемость бизнеса."
+    ]
+    if business_type == "Торговля":
+        base[1] = "Фокус: проверить валовую маржу по ключевым товарным группам и скидочную политику. Цель: вернуть маржинальность."
+    elif business_type == "Услуги":
+        base[1] = "Фокус: проверить загрузку команды и выработку на человека. Цель: повысить прибыльность."
+    elif business_type == "IT / Digital":
+        base[1] = "Фокус: проверить долю ФОТ и рентабельность проектов. Цель: улучшить прибыльность портфеля."
+    elif business_type == "Производство":
+        base[1] = "Фокус: разложить себестоимость на сырьё/энергию/персонал. Цель: найти драйвер роста затрат."
+    elif business_type == "Ломбард":
+        base[1] = "Фокус: проверить долю ФОТ и аренды относительно процентного дохода. Цель: повысить устойчивость маржи."
+    return base
+
+
+def consulting_headline(m: pd.DataFrame, status: str, main_risk: dict | None) -> str:
+    if main_risk:
+        title, _ = consulting_risk_text(main_risk)
+        return title
+
+    if m is None or m.empty:
+        return "Недостаточно данных для управленческого вывода"
+
+    last = m.index.max()
+    mar = safe_float(m.loc[last, "Маржа"]) * 100
+    if status == "OK":
+        return f"Финансы в норме: маржа {mar:.1f}% без критичных отклонений"
+    return f"Текущая маржа {mar:.1f}% требует внимания"
+
+
+def generate_insights(risks, m: pd.DataFrame, cmp, business_type: str, target_margin: float, currency: str, top_cat: str | None):
+    """
+    Returns (insights, actions) — consulting tone.
+    """
+    insights = []
 
     if not m.empty:
         last = m.index.max()
@@ -400,155 +516,28 @@ def generate_insights(risks, m: pd.DataFrame, cmp, business_type: str, target_ma
         exp = safe_float(m.loc[last, "Расходы"])
         prof = safe_float(m.loc[last, "Прибыль"])
         mar = safe_float(m.loc[last, "Маржа"])
-        insights.append(f"Последний месяц: выручка {rev:,.0f}, расходы {exp:,.0f}, прибыль {prof:,.0f}, маржа {mar:.1%}.")
+        insights.append(f"Последний месяц: выручка {fmt_money(rev, currency)}, расходы {fmt_money(exp, currency)}, прибыль {fmt_money(prof, currency)}, маржа {mar:.1%}.")
         insights.append(f"Тип бизнеса: {business_type}. Целевая маржа: {target_margin:.0f}%.")
+
+    if top_cat:
+        insights.append(f"Ключевая статья расходов по объёму: «{top_cat}».")
 
     if cmp:
         insights.append(f"MoM: выручка {cmp['revenue_change']:+.1%}, расходы {cmp['expense_change']:+.1%}, маржа {cmp['margin_pp']:+.1f} п.п.")
 
-    for r in risks:
-        t = (r.get("title") or "").lower()
-        if "концентрация" in t:
-            actions += [
-                "Проверить 5 самых крупных списаний в этой категории.",
-                "Согласовать лимит по категории на следующий месяц.",
-                "Проверить договоры/подписки и убрать лишнее."
-            ]
-        if "маржа" in t:
-            actions += [
-                "Проверить рост постоянных расходов и разовые платежи.",
-                "Проанализировать цены/скидки и маржинальность по продуктам/услугам.",
-                "Сравнить маржу по проектам/филиалам."
-            ]
-        if "убыток" in t:
-            actions += [
-                "Сократить необязательные расходы в ближайшие 2–4 недели.",
-                "Пересмотреть лимиты по категориям.",
-                "Сделать план роста выручки на 30 дней (3 гипотезы)."
-            ]
-        if "рост расходов" in t:
-            actions += [
-                "Найти разовые платежи в последнем месяце и подтвердить их необходимость.",
-                "Разделить расходы на постоянные и переменные.",
-                "Ввести простой контроль: недельный лимит."
-            ]
-
-    if business_type == "Торговля":
-        actions += ["Проверить валовую маржу по ключевым товарным группам и скидочную политику."]
-    elif business_type == "Услуги":
-        actions += ["Проверить загрузку команды и долю непроизводительных часов."]
-    elif business_type == "IT / Digital":
-        actions += ["Проверить долю ФОТ и окупаемость проектов по контрактам."]
-    elif business_type == "Производство":
-        actions += ["Разложить себестоимость на сырьё/энергию/персонал и найти драйвер роста затрат."]
-
-    actions = list(dict.fromkeys(actions))[:7]
-    if not actions:
-        actions = ["Провести контрольную проверку данных и уточнить структуру категорий расходов."]
-
-    return insights[:7], actions[:7]
-
-
-# =========================
-# Explainability
-# =========================
-def explain_risk(risk: dict, m: pd.DataFrame, target_margin: float, currency: str):
-    if not risk or m is None or m.empty:
-        return []
-
-    title = (risk.get("title") or "").lower()
-    last = m.index.max()
-    row = m.loc[last]
-
-    explanations = []
-    rev = safe_float(row.get("Выручка", 0))
-    exp = safe_float(row.get("Расходы", 0))
-    prof = safe_float(row.get("Прибыль", 0))
-    mar_pct = safe_float(row.get("Маржа", 0)) * 100
-    explanations.append(f"Последний месяц: выручка {rev:,.0f}, расходы {exp:,.0f}, прибыль {prof:,.0f}, маржа {mar_pct:.1f}%.")
-
-    if "маржа" in title:
-        fact = safe_float(row.get("Маржа", 0)) * 100
-        gap_pp = target_margin - fact
-        impact = max(0.0, gap_pp / 100.0) * rev * 12.0
-        explanations += [
-            f"Целевая маржа: {target_margin:.0f}%. Фактическая: {fact:.1f}%.",
-            f"Отклонение: −{gap_pp:.1f} п.п.",
-        ]
-        if rev > 0:
-            explanations.append(f"Оценка недополученной прибыли: ≈ {impact:,.0f} {currency} в год (если тренд сохранится).")
-
-    if "падение маржи" in title:
-        explanations.append("Маржа снизилась относительно прошлого месяца — это ухудшает устойчивость прибыли.")
-
-    if "концентрация" in title:
-        explanations += [
-            "Одна категория расходов занимает непропорционально большую долю.",
-            "При высокой концентрации любое увеличение в этой категории резко бьёт по прибыли."
-        ]
-
-    if "убыток" in title:
-        explanations += [
-            "Расходы превысили выручку в последнем месяце.",
-            "Это означает отрицательный финансовый результат за период."
-        ]
-
-    if "рост расходов" in title:
-        explanations += [
-            "Расходы выросли быстрее, чем ранее, что может продолжить снижать маржу.",
-            "Часто причина — разовые платежи или рост постоянных затрат."
-        ]
-
-    return explanations
-
-
-# =========================
-# XLSX export
-# =========================
-def build_xlsx_export(normalized: pd.DataFrame, metrics: pd.DataFrame, risks: list, currency: str) -> BytesIO:
-    buf = BytesIO()
-
+    # main risk
+    main_risk = None
     if risks:
-        risks_df = pd.DataFrame([{
-            "Уровень": r.get("level"),
-            "Заголовок": r.get("title"),
-            "Детали": r.get("details"),
-        } for r in risks])
-    else:
-        risks_df = pd.DataFrame([{"Уровень": "", "Заголовок": "Рисков не выявлено", "Детали": ""}])
+        for r in risks:
+            if r.get("level") == "CRIT":
+                main_risk = r
+                break
+        if main_risk is None:
+            main_risk = risks[0]
 
-    metrics_out = metrics.copy()
-    if not metrics_out.empty:
-        metrics_out = metrics_out.reset_index()
-        idx_col = metrics_out.columns[0]
-        metrics_out = metrics_out.rename(columns={idx_col: "Месяц"})
-        metrics_out["Месяц"] = pd.to_datetime(metrics_out["Месяц"], errors="coerce").dt.strftime("%Y-%m")
+    actions = consulting_actions(main_risk=main_risk, business_type=business_type, top_category=top_cat)
 
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        normalized_out = normalized.copy()
-        normalized_out["date"] = pd.to_datetime(normalized_out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        normalized_out.to_excel(writer, index=False, sheet_name="Transactions")
-        (metrics_out if not metrics_out.empty else pd.DataFrame([{"Месяц": ""}])).to_excel(writer, index=False, sheet_name="Monthly_Metrics")
-        risks_df.to_excel(writer, index=False, sheet_name="Risks")
-        pd.DataFrame([{
-            "currency": currency,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }]).to_excel(writer, index=False, sheet_name="Meta")
-
-    buf.seek(0)
-    return buf
-
-
-# =========================
-# PDF (consulting style)
-# =========================
-FONT_FILE = "DejaVuSans.ttf"
-if os.path.exists(FONT_FILE):
-    pdfmetrics.registerFont(TTFont("MainFont", FONT_FILE))
-    FONT_OK = True
-else:
-    FONT_OK = False
-
+    return insights[:6], actions
 
 def pick_main_risk(risks: list) -> dict | None:
     if not risks:
@@ -730,7 +719,7 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
     # 3 actions
     top_actions = (actions or [])[:3]
     actions_html = "<br/>".join([f"• {a}" for a in top_actions]) if top_actions else "• Проверь корректность данных и категорий расходов."
-    story.append(pdf_block("Первые действия (2–4 недели)", actions_html, styles,
+    story.append(pdf_block("Рекомендуемые управленческие действия (30 дней) (2–4 недели)", actions_html, styles,
                            bg=colors.HexColor("#F0F9FF"), border=colors.HexColor("#B2DDFF")))
     story.append(Spacer(1, 6))
     story.append(Paragraph("Отчёт сформирован автоматически. Для управленческих решений рекомендуется сверка первичных данных.", styles["B_SMALL"]))
@@ -923,7 +912,7 @@ def render_owner_mode(company_name: str, source_name: str, period_text: str,
             st.info("Недостаточно месяцев для сравнения.")
 
         st.write("")
-        st.markdown(ui_section("Первые действия", "Что сделать в ближайшие 2–4 недели"), unsafe_allow_html=True)
+        st.markdown(ui_section("Рекомендуемые управленческие действия (30 дней)", "Что сделать в ближайшие 2–4 недели"), unsafe_allow_html=True)
         if actions:
             st.markdown("<div class='card'>" + "".join([f"<div>• {a}</div>" for a in actions[:3]]) + "</div>", unsafe_allow_html=True)
         else:
