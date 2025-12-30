@@ -1,3 +1,4 @@
+
 import os
 import re
 from io import BytesIO
@@ -21,6 +22,39 @@ from reportlab.pdfbase.ttfonts import TTFont
 # Streamlit config
 # =========================
 st.set_page_config(page_title="Owner Report", layout="wide")
+
+
+# =========================
+# Fonts (robust for Streamlit Cloud)
+# =========================
+# We try to register a Unicode font if available. If not, fall back to built-in Helvetica.
+def _find_font_file() -> str | None:
+    candidates = [
+        # put a font next to app.py if you want
+        os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf"),
+        os.path.join(os.path.dirname(__file__), "Arial.ttf"),
+        # common linux paths (Streamlit Cloud often has DejaVu)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+MAIN_FONT = "Helvetica"
+FONT_FILE = _find_font_file()
+FONT_OK = False
+
+if FONT_FILE:
+    try:
+        pdfmetrics.registerFont(TTFont("MainFont", FONT_FILE))
+        MAIN_FONT = "MainFont"
+        FONT_OK = True
+    except Exception:
+        # keep Helvetica
+        FONT_OK = False
 
 
 # =========================
@@ -178,7 +212,6 @@ def apply_app_theme():
     </style>
     """, unsafe_allow_html=True)
 
-
 apply_app_theme()
 
 
@@ -253,7 +286,7 @@ def read_file(file) -> pd.DataFrame:
         return pd.read_csv(file)
     if name.endswith(".xlsx"):
         return pd.read_excel(BytesIO(file.getvalue()), engine="openpyxl")
-    raise ValueError("Неподдерживаемый формат")
+    raise ValueError("Неподдерживаемый формат (нужен .xlsx или .csv)")
 
 def guess_columns(cols):
     ncols = [norm(c) for c in cols]
@@ -335,6 +368,16 @@ def compare_periods(m: pd.DataFrame):
         "margin_pp": margin_pp,
     }
 
+def top_expense_category(flt: pd.DataFrame) -> str | None:
+    exp = flt[flt["amount"] < 0].copy()
+    if exp.empty:
+        return None
+    exp["expense_abs"] = -exp["amount"]
+    by_cat = exp.groupby("category")["expense_abs"].sum().sort_values(ascending=False)
+    if by_cat.empty:
+        return None
+    return str(by_cat.index[0])
+
 def calc_risks(flt: pd.DataFrame, m: pd.DataFrame, target_margin: float):
     risks = []
     if m.empty:
@@ -357,7 +400,7 @@ def calc_risks(flt: pd.DataFrame, m: pd.DataFrame, target_margin: float):
         if lvl:
             risks.append({"level": lvl, "title": "Падение маржи", "details": f"Маржа упала на {drop_pp:.1f} п.п. ({prev_margin:.1%} → {last_margin:.1%})."})
 
-    # 3) Expense concentration (raw category)
+    # 3) Expense concentration
     exp = flt[flt["amount"] < 0].copy()
     if not exp.empty:
         exp["expense_abs"] = -exp["amount"]
@@ -391,54 +434,72 @@ def calc_risks(flt: pd.DataFrame, m: pd.DataFrame, target_margin: float):
     status = "CRITICAL" if any(r["level"] == "CRIT" for r in risks) else "WARNING" if any(r["level"] == "WARN" for r in risks) else "OK"
     return risks, status
 
+
 # ============================================================
-# Consulting-style text layer (A)
+# Explainability layer
 # ============================================================
-def consulting_risk_text(risk: dict) -> tuple[str, str]:
+def explain_risk(risk: dict, m: pd.DataFrame, target_margin: float, currency: str) -> list[str]:
     """
-    Returns (title, body) in 'top consulting' tone.
-    Keeps numeric details produced by risk detection in body (transparency).
+    Returns a short, concrete explanation list (bullets) for the expander and PDF page 2.
     """
-    t_raw = (risk.get("title") or "").lower()
-    details = risk.get("details") or ""
+    title = (risk.get("title") or "").lower()
+    lvl = risk.get("level", "")
+    out = []
 
-    if "маржа" in t_raw and ("цел" in t_raw or "ниже" in t_raw):
-        return (
-            "Текущая структура затрат не позволяет достигать целевую прибыльность бизнеса",
-            details
-        )
+    if m is None or m.empty:
+        return ["Недостаточно данных по месяцам, чтобы объяснить риск."]
 
-    if "падение маржи" in t_raw:
-        return (
-            "Маржинальность ухудшается месяц-к-месяцу — прибыль становится менее устойчивой",
-            details
-        )
+    last = m.index.max()
+    prev = m.index[-2] if len(m) >= 2 else None
 
-    if "концентрация" in t_raw:
-        return (
-            "Слишком высокая концентрация расходов в одной категории снижает управляемость затрат",
-            details
-        )
+    last_rev = safe_float(m.loc[last, "Выручка"])
+    last_exp = safe_float(m.loc[last, "Расходы"])
+    last_profit = safe_float(m.loc[last, "Прибыль"])
+    last_margin = safe_float(m.loc[last, "Маржа"])
 
-    if "убыток" in t_raw:
-        return (
-            "Последний месяц закрыт с отрицательным финансовым результатом",
-            details
-        )
+    out.append(f"Уровень: {lvl}.")
 
-    if "рост расходов" in t_raw:
-        return (
-            "Темпы роста расходов опережают динамику выручки",
-            details
-        )
+    if "убыток" in title:
+        out.append(f"В последнем месяце прибыль отрицательная: {fmt_money(last_profit, currency)}.")
+        out.append("Это означает, что расходы превышают выручку за период.")
+        return out
 
-    return (risk.get("title", "Выявлено управленческое отклонение"), details)
+    if "падение маржи" in title and prev is not None:
+        prev_margin = safe_float(m.loc[prev, "Маржа"])
+        out.append(f"Маржа снизилась: {prev_margin:.1%} → {last_margin:.1%}.")
+        out.append("При той же выручке снижение маржи прямо уменьшает прибыль.")
+        return out
+
+    if "концентрация расходов" in title:
+        out.append("Большая доля расходов приходится на одну категорию.")
+        out.append("Риск: один источник затрат начинает управлять всем P&L.")
+        out.append("Проверь: разовые платежи, подписки, договоры, корректность классификации.")
+        return out
+
+    if "резкий рост расходов" in title and prev is not None:
+        prev_exp = safe_float(m.loc[prev, "Расходы"])
+        out.append(f"Расходы выросли месяц-к-месяцу: {fmt_money(prev_exp, currency)} → {fmt_money(last_exp, currency)}.")
+        out.append("Если выручка не растёт быстрее — маржа падает.")
+        return out
+
+    if "маржа ниже целевой" in title and target_margin:
+        target = target_margin / 100.0
+        gap_pp = max(0.0, (target - last_margin) * 100.0)
+        out.append(f"Цель: {target_margin:.0f}%, факт: {last_margin*100:.1f}%. Разрыв: {gap_pp:.1f} п.п.")
+        if last_rev > 0 and gap_pp > 0:
+            annual_impact = (gap_pp / 100.0) * last_rev * 12.0
+            out.append(f"Оценка недополученной прибыли при сохранении разрыва: ~{fmt_money(annual_impact, currency)}/год.")
+        return out
+
+    # fallback
+    out.append("Риск сработал по правилу отклонений в метриках последнего месяца.")
+    return out
 
 
+# ============================================================
+# Consulting-style text layer
+# ============================================================
 def consulting_actions(main_risk: dict | None, business_type: str, top_category: str | None) -> list[str]:
-    """
-    3 actions, each with purpose. Consulting-style.
-    """
     cat = top_category or "ключевой категории расходов"
     t = ((main_risk or {}).get("title") or "").lower()
 
@@ -470,7 +531,6 @@ def consulting_actions(main_risk: dict | None, business_type: str, top_category:
             "Привязка к выручке: зафиксировать KPI (расходы/выручка) и контроль отклонений. Цель: стабилизировать маржу."
         ]
 
-    # fallback + business nuance
     base = [
         "Контроль: проверить корректность данных и структуру категорий. Цель: исключить ошибки классификации.",
         "Фокус: выделить 3 крупнейшие статьи расходов и драйверы роста. Цель: найти быстрый эффект.",
@@ -484,33 +544,15 @@ def consulting_actions(main_risk: dict | None, business_type: str, top_category:
         base[1] = "Фокус: проверить долю ФОТ и рентабельность проектов. Цель: улучшить прибыльность портфеля."
     elif business_type == "Производство":
         base[1] = "Фокус: разложить себестоимость на сырьё/энергию/персонал. Цель: найти драйвер роста затрат."
-    elif business_type == "Ломбард":
-        base[1] = "Фокус: проверить долю ФОТ и аренды относительно процентного дохода. Цель: повысить устойчивость маржи."
     return base
-
-
-def consulting_headline(m: pd.DataFrame, status: str, main_risk: dict | None) -> str:
-    if main_risk:
-        title, _ = consulting_risk_text(main_risk)
-        return title
-
-    if m is None or m.empty:
-        return "Недостаточно данных для управленческого вывода"
-
-    last = m.index.max()
-    mar = safe_float(m.loc[last, "Маржа"]) * 100
-    if status == "OK":
-        return f"Финансы в норме: маржа {mar:.1f}% без критичных отклонений"
-    return f"Текущая маржа {mar:.1f}% требует внимания"
-
 
 def generate_insights(risks, m: pd.DataFrame, cmp, business_type: str, target_margin: float, currency: str, top_cat: str | None):
     """
-    Returns (insights, actions) — consulting tone.
+    Returns (insights, actions)
     """
-    insights = []
+    insights: list[str] = []
 
-    if not m.empty:
+    if m is not None and not m.empty:
         last = m.index.max()
         rev = safe_float(m.loc[last, "Выручка"])
         exp = safe_float(m.loc[last, "Расходы"])
@@ -536,7 +578,6 @@ def generate_insights(risks, m: pd.DataFrame, cmp, business_type: str, target_ma
             main_risk = risks[0]
 
     actions = consulting_actions(main_risk=main_risk, business_type=business_type, top_category=top_cat)
-
     return insights[:6], actions
 
 def pick_main_risk(risks: list) -> dict | None:
@@ -548,6 +589,32 @@ def pick_main_risk(risks: list) -> dict | None:
     return risks[0]
 
 
+# =========================
+# XLSX Export
+# =========================
+def build_xlsx_export(normalized: pd.DataFrame, metrics: pd.DataFrame, risks: list, currency: str) -> BytesIO:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        normalized.to_excel(writer, index=False, sheet_name="Transactions")
+        if metrics is None or metrics.empty:
+            pd.DataFrame({"note": ["no metrics"]}).to_excel(writer, index=False, sheet_name="Metrics")
+        else:
+            m2 = metrics.copy()
+            m2.index.name = "month"
+            m2.reset_index().to_excel(writer, index=False, sheet_name="Metrics")
+
+        r_df = pd.DataFrame(risks or [])
+        if not r_df.empty:
+            r_df.to_excel(writer, index=False, sheet_name="Risks")
+        else:
+            pd.DataFrame({"status": ["OK"], "details": ["Риски не выявлены"]}).to_excel(writer, index=False, sheet_name="Risks")
+    buf.seek(0)
+    return buf
+
+
+# =========================
+# PDF helpers
+# =========================
 def pdf_block(title: str, body_html: str, styles, bg, border, pad=10):
     t = Table([[Paragraph(f"<b>{title}</b>", styles["B_H3"]),
                 Paragraph(body_html, styles["B_BODY"])]],
@@ -559,7 +626,6 @@ def pdf_block(title: str, body_html: str, styles, bg, border, pad=10):
         ("PADDING", (0, 0), (-1, -1), pad),
     ]))
     return t
-
 
 def pdf_kpi_cards(kpis: list[tuple[str, str]], styles):
     cells = []
@@ -581,7 +647,6 @@ def pdf_kpi_cards(kpis: list[tuple[str, str]], styles):
     row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
     return row
 
-
 def pdf_money_big(title: str, value: str, subtitle: str, styles, bg, border):
     tbl = Table(
         [[Paragraph(f"<b>{title}</b>", styles["B_H3"])],
@@ -596,13 +661,9 @@ def pdf_money_big(title: str, value: str, subtitle: str, styles, bg, border):
     ]))
     return tbl
 
-
 def build_pdf(company_name: str, source_name: str, period_text: str,
               status: str, m: pd.DataFrame, risks, insights, actions,
               business_type: str, target_margin: float, currency: str, cmp) -> BytesIO:
-    if not FONT_OK:
-        raise FileNotFoundError(f"Не найден шрифт {FONT_FILE}. Положи его рядом с app.py")
-
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
@@ -611,15 +672,15 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
     )
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="B_TITLE", fontName="MainFont", fontSize=20, leading=24, spaceAfter=4))
-    styles.add(ParagraphStyle(name="B_SUB", fontName="MainFont", fontSize=10, leading=14, textColor=colors.HexColor("#475467")))
-    styles.add(ParagraphStyle(name="B_H2", fontName="MainFont", fontSize=12, leading=16, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#101828")))
-    styles.add(ParagraphStyle(name="B_H3", fontName="MainFont", fontSize=11, leading=14, spaceAfter=4, textColor=colors.HexColor("#101828")))
-    styles.add(ParagraphStyle(name="B_BODY", fontName="MainFont", fontSize=10, leading=14, textColor=colors.HexColor("#101828")))
-    styles.add(ParagraphStyle(name="B_SMALL", fontName="MainFont", fontSize=8.5, leading=11, textColor=colors.HexColor("#667085")))
-    styles.add(ParagraphStyle(name="B_KPI", fontName="MainFont", fontSize=14, leading=18, textColor=colors.HexColor("#101828")))
-    styles.add(ParagraphStyle(name="B_BIG", fontName="MainFont", fontSize=18, leading=22, textColor=colors.HexColor("#101828")))
-    styles.add(ParagraphStyle(name="B_TAG", fontName="MainFont", fontSize=10, leading=12, textColor=colors.white))
+    styles.add(ParagraphStyle(name="B_TITLE", fontName=MAIN_FONT, fontSize=20, leading=24, spaceAfter=4))
+    styles.add(ParagraphStyle(name="B_SUB", fontName=MAIN_FONT, fontSize=10, leading=14, textColor=colors.HexColor("#475467")))
+    styles.add(ParagraphStyle(name="B_H2", fontName=MAIN_FONT, fontSize=12, leading=16, spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#101828")))
+    styles.add(ParagraphStyle(name="B_H3", fontName=MAIN_FONT, fontSize=11, leading=14, spaceAfter=4, textColor=colors.HexColor("#101828")))
+    styles.add(ParagraphStyle(name="B_BODY", fontName=MAIN_FONT, fontSize=10, leading=14, textColor=colors.HexColor("#101828")))
+    styles.add(ParagraphStyle(name="B_SMALL", fontName=MAIN_FONT, fontSize=8.5, leading=11, textColor=colors.HexColor("#667085")))
+    styles.add(ParagraphStyle(name="B_KPI", fontName=MAIN_FONT, fontSize=14, leading=18, textColor=colors.HexColor("#101828")))
+    styles.add(ParagraphStyle(name="B_BIG", fontName=MAIN_FONT, fontSize=18, leading=22, textColor=colors.HexColor("#101828")))
+    styles.add(ParagraphStyle(name="B_TAG", fontName=MAIN_FONT, fontSize=10, leading=12, textColor=colors.white))
 
     if status == "CRITICAL":
         status_bg = colors.HexColor("#D92D20")
@@ -635,9 +696,7 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
 
     story = []
 
-    # =========================
     # PAGE 1 — Executive Summary
-    # =========================
     story.append(Paragraph("Отчёт для собственника", styles["B_TITLE"]))
     story.append(Paragraph(
         f"<b>{company_name}</b> · {business_type} · Цель маржи: <b>{target_margin:.0f}%</b> · Валюта: <b>{currency}</b>",
@@ -724,9 +783,7 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
     story.append(Spacer(1, 6))
     story.append(Paragraph("Отчёт сформирован автоматически. Для управленческих решений рекомендуется сверка первичных данных.", styles["B_SMALL"]))
 
-    # =========================
     # PAGE 2 — Explainability
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph("Почему система считает это риском", styles["B_TITLE"]))
     story.append(Paragraph("Прозрачная логика: факт → отклонение → последствия.", styles["B_SUB"]))
@@ -751,15 +808,12 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
     else:
         story.append(pdf_block("Изменения месяц-к-месяцу", "Недостаточно месяцев для сравнения.", styles, bg=colors.HexColor("#F8FAFC"), border=c_border))
 
-    # =========================
     # PAGE 3 — Details
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph("Детали и наблюдения", styles["B_TITLE"]))
     story.append(Paragraph("Для сверки и уточнения причин отклонений.", styles["B_SUB"]))
     story.append(Spacer(1, 10))
 
-    # compact KPI table
     kpi_data = [["Показатель", "Значение"]]
     if m is not None and not m.empty:
         kpi_data += [
@@ -779,7 +833,7 @@ def build_pdf(company_name: str, source_name: str, period_text: str,
 
     kpi_tbl = Table(kpi_data, colWidths=[110*mm, 70*mm])
     kpi_tbl.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), "MainFont"),
+        ("FONTNAME", (0, 0), (-1, -1), MAIN_FONT),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F4F7")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#101828")),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#EAECF0")),
@@ -888,11 +942,8 @@ def render_owner_mode(company_name: str, source_name: str, period_text: str,
 
             with st.expander("🔍 Почему это считается риском?"):
                 expl = explain_risk(main_risk, m=m, target_margin=target_margin, currency=currency)
-                if expl:
-                    for e in expl:
-                        st.write("•", e)
-                else:
-                    st.write("Недостаточно данных для подробного объяснения.")
+                for e in (expl or []):
+                    st.write("•", e)
         else:
             st.markdown("""
             <div class="card">
@@ -931,19 +982,19 @@ def render_owner_mode(company_name: str, source_name: str, period_text: str,
 
         st.write("")
         st.markdown(ui_section("Отчёт", "PDF для пересылки"), unsafe_allow_html=True)
-        if not FONT_OK:
-            st.error(f"Не найден шрифт {FONT_FILE}. Положи его рядом с app.py.")
+        if pdf_buf is not None:
+            st.download_button(
+                "⬇️ Скачать PDF (Owner report)",
+                data=pdf_buf,
+                file_name="owner_report.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
         else:
-            if pdf_buf is not None:
-                st.download_button(
-                    "⬇️ Скачать PDF (Owner report)",
-                    data=pdf_buf,
-                    file_name="owner_report.pdf",
-                    mime="application/pdf",
-                    width="stretch",
-                )
-            else:
-                st.info("Сначала сделай анализ — появится кнопка PDF.")
+            # PDF can still fail even if font exists, so show a hint
+            if not FONT_OK and MAIN_FONT == "Helvetica":
+                st.info("PDF будет на шрифте Helvetica (если нужен кириллический PDF — добавь DejaVuSans.ttf рядом с app.py).")
+            st.info("Сначала сделай анализ — появится кнопка PDF.")
 
 
 # =========================
@@ -990,11 +1041,8 @@ def render_analytics(df_raw: pd.DataFrame, normalized: pd.DataFrame, m: pd.DataF
 
             with st.expander("🔍 Почему это считается риском?"):
                 expl = explain_risk(r, m=m, target_margin=target_margin, currency=currency)
-                if expl:
-                    for e in expl:
-                        st.write("•", e)
-                else:
-                    st.write("Недостаточно данных для подробного объяснения.")
+                for e in (expl or []):
+                    st.write("•", e)
 
             st.write("")
     else:
@@ -1123,32 +1171,38 @@ flt = out[(out["date"] >= start) & (out["date"] <= end)].copy()
 # Compute
 m = compute_metrics(flt)
 cmp = compare_periods(m)
+top_cat = top_expense_category(flt)
 risks, status = calc_risks(flt, m, target_margin=target_margin)
-insights, actions = generate_insights(risks=risks, m=m, cmp=cmp, business_type=business_type, target_margin=target_margin)
+insights, actions = generate_insights(
+    risks=risks, m=m, cmp=cmp,
+    business_type=business_type,
+    target_margin=target_margin,
+    currency=currency,
+    top_cat=top_cat
+)
 
 period_text = f"{start.strftime('%d.%m.%Y')}–{end.strftime('%d.%m.%Y')}"
 source_name = uploaded.name
 
 pdf_buf = None
-if FONT_OK:
-    try:
-        pdf_buf = build_pdf(
-            company_name=company_name,
-            source_name=source_name,
-            period_text=period_text,
-            status=status,
-            m=m,
-            risks=risks,
-            insights=insights,
-            actions=actions,
-            business_type=business_type,
-            target_margin=target_margin,
-            currency=currency,
-            cmp=cmp
-        )
-    except Exception as e:
-        pdf_buf = None
-        st.warning(f"PDF не собрался: {e}")
+try:
+    pdf_buf = build_pdf(
+        company_name=company_name,
+        source_name=source_name,
+        period_text=period_text,
+        status=status,
+        m=m,
+        risks=risks,
+        insights=insights,
+        actions=actions,
+        business_type=business_type,
+        target_margin=target_margin,
+        currency=currency,
+        cmp=cmp
+    )
+except Exception as e:
+    pdf_buf = None
+    st.warning(f"PDF не собрался: {e}")
 
 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
